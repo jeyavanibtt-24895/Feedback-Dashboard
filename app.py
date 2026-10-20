@@ -99,8 +99,14 @@ def prepare(raw):
 st.title("📊 Trainer Feedback Dashboard")
 st.write("End-of-course feedback across all organizations and courses.")
 
+DATA_SOURCE = st.secrets.get("data_source", "live")
+DEMO = DATA_SOURCE == "demo"
+
 try:
-    raw, fetched_at = load_sheet()
+    if DEMO:
+        raw = pd.read_csv(DEMO_FILE, dtype=str, keep_default_na=False)
+    else:
+        raw, fetched_at = load_sheet()
 except Exception:
     st.error("Couldn't load the feedback data right now. Please try again in a few minutes.")
     st.stop()
@@ -114,8 +120,14 @@ if df.empty:
     st.info("No feedback responses yet. Check back soon!")
     st.stop()
 
-st.caption(f"Live data from the feedback form · Last updated {fetched_at} · Refreshes every 5 minutes")
-
+if DEMO:
+    st.warning(
+        "**Demo mode:** this dashboard is showing synthetic sample data to demonstrate "
+        "how the analyzer works. The organizations, ratings and comments are not real "
+        "learner feedback."
+    )
+else:
+    st.caption(f"Live data from the feedback form · Last updated {fetched_at} · Refreshes every 5 minutes")
 
 # ---------------- Helpers ----------------
 def show(fig, height=None):
@@ -350,8 +362,11 @@ with tab5:
     with c2:
         top_counts_chart(df["idea"], "Ideas to make the course better", color="#7b2cbf")
 
-    st.subheader("🌟 Testimonial wall")
-    st.caption("Only from learners who allowed their words to be shared.")
+        st.subheader("🌟 Testimonial wall")
+    if DEMO:
+        st.caption("Sample testimonials from synthetic data, shown for demonstration only.")
+    else:
+        st.caption("Only from learners who allowed their words to be shared.")
     consent = df["consent"].astype("string")
     wall = df[consent.str.startswith("Yes").fillna(False) & df["comment"].notna()].copy()
     if wall.empty:
