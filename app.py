@@ -49,6 +49,8 @@ FILES IN THE GITHUB REPOSITORY
 =====================================================================
  SECRETS FORMAT (Streamlit → ⋮ → Settings → Secrets)
 =====================================================================
+  GEMINI_API_KEY = "..."               # from Google AI Studio (aistudio.google.com)
+  GEMINI_MODEL = "gemini-3.6-flash"    # optional: change model without editing code
   data_source = "demo"                 # "demo" or "live"
   sheet_id = "LONG_ID_FROM_SHEET_URL"  # text between /d/ and /edit
   # worksheet_name = "Tab name"        # optional: only if responses
@@ -128,6 +130,9 @@ import plotly.express as px            # interactive charts
 import gspread                         # reads Google Sheets
 from datetime import datetime          # "Last updated" time
 from zoneinfo import ZoneInfo          # shows that time in Indian time
+import json                            # reads the AI's answer
+from google import genai               # Gemini (GenAI) for the AI Insights tab
+from google.genai import types
 
 # Page title, browser-tab icon and wide layout (uses the full screen width)
 st.set_page_config(
@@ -143,6 +148,11 @@ st.set_page_config(
 REFRESH_SECONDS = 300            # how often live data is re-fetched (300 = 5 minutes)
 TIMEZONE = "Asia/Kolkata"        # time zone for the "Last updated" line
 DEMO_FILE = "Synthetic_Course_Feedback.csv"   # sample data file in this GitHub repo
+
+# AI Insights (Gemini)
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"   # can be overridden with GEMINI_MODEL in Secrets
+AI_REFRESH_SECONDS = 86400                  # re-use AI insights for up to 24 hours
+MAX_COMMENTS_FOR_AI = 150                   # most recent comments sent to Gemini
 
 # ---------------------------------------------------------------------
 # COLUMN MAPS
@@ -369,12 +379,147 @@ def share_chart(data, group, column, order, colors, title):
         hover_data={"Count": True, "Percent": ":.0f"}
     )
     show(fig, max(320, 40 * data[group].nunique() + 120))
+# =====================================================================
+# AI INSIGHTS (GEMINI)
+# Only summaries and anonymous text answers are sent to Gemini:
+# no names, no emails, no timestamps. The AI result is cached, so
+# Gemini is called again only when the data changes (new responses)
+# or after AI_REFRESH_SECONDS. Visitors do NOT trigger a call each visit.
+# =====================================================================
+AI_SYSTEM_PROMPT = """
+You are an experienced Learning & Development analyst helping a technical trainer
+improve her courses. You analyse end-of-course feedback data.
 
+Rules:
+- Base every statement only on the data provided. Do not invent numbers.
+- Never mention learner names, and never quote comments word for word; paraphrase.
+- Write in simple, clear English for a trainer, not a data scientist.
+- Be specific and practical: name topics, batches and learner types where relevant.
+- Return ONLY valid JSON, with no extra text and no markdown fences.
+"""
+
+AI_OUTPUT_FORMAT = """
+Return JSON in exactly this structure:
+{
+  "headline": "one sentence with the single most important finding",
+  "summary": "3-4 sentences summarising overall teaching performance",
+  "strengths": ["3 short points about what is working well"],
+  "improvements": ["3 short points about what to improve"],
+  "difficult_themes": [
+    {"theme": "short theme name", "examples": ["2-3 related topics"], "suggestion": "one practical teaching fix"}
+  ],
+  "sentiment": {"positive": 0, "neutral": 0, "negative": 0, "summary": "one sentence"},
+  "batch_actions": [
+    {"batch": "exact batch name from the data", "focus": "main issue or strength", "actions": ["2 concrete actions"]}
+  ],
+  "next_course_tips": ["3 tips for the next course"]
+}
+sentiment values are estimated percentages of the comments and must add up to 100.
+Include 3-5 difficult_themes and one batch_actions entry per batch.
+"""
+
+
+def _round(value):
+    """Rounds a number for the AI payload; empty values become None."""
+    return None if pd.isna(value) else round(float(value), 2)
+
+
+def _counts(series, n):
+    """Top-n answers with counts, as a plain dict for JSON."""
+    return {str(k): int(v) for k, v in series.dropna().value_counts().head(n).items()}
+
+
+def build_ai_payload(data):
+    """
+    Turns the feedback into a compact JSON text for Gemini:
+    overall numbers, one block per batch, per learner type, and
+    anonymous free-text answers. No names or emails are included.
+    """
+    overall = {
+        "learners": int(len(data)),
+        "organizations": int(data["organization"].nunique()),
+        "batches": int(data["batch"].nunique()),
+        "average_ratings_out_of_5": {q: _round(data[q].mean()) for q in RATINGS},
+        "recommend_pct": _counts(data["recommend"], 3),
+        "pace_counts": _counts(data["pace"], 3),
+        "learner_types": _counts(data["role"], 5),
+        "delivery_modes": _counts(data["mode"], 3),
+    }
+
+    batches = []
+    for batch, g in data.groupby("batch"):
+        batches.append({
+            "batch": batch,
+            "learners": int(len(g)),
+            "learner_types": _counts(g["role"], 4),
+            "average_ratings": {q: _round(g[q].mean()) for q in RATINGS},
+            "recommend_yes_pct": _round((g["recommend"] == "Yes").mean() * 100),
+            "too_fast_pct": _round((g["pace"] == "Too fast").mean() * 100),
+            "top_difficult_topics": _counts(g["difficult"], 5),
+            "top_helped_most": _counts(g["helped_most"], 3),
+            "top_ideas": _counts(g["idea"], 3),
+        })
+
+    by_role = []
+    for role, g in data.groupby("role"):
+        by_role.append({
+            "learner_type": role,
+            "learners": int(len(g)),
+            "overall_rating": _round(g["Overall rating"].mean()),
+            "too_fast_pct": _round((g["pace"] == "Too fast").mean() * 100),
+        })
+
+    comments = (
+        data.sort_values("timestamp", ascending=False)["comment"]
+        .dropna().astype(str).str.slice(0, 300)
+        .head(MAX_COMMENTS_FOR_AI).tolist()
+    )
+
+    payload = {
+        "overall": overall,
+        "batches": batches,
+        "by_learner_type": by_role,
+        "difficult_topics_all": _counts(data["difficult"], 30),
+        "useful_topics_all": _counts(data["useful"], 30),
+        "improvement_ideas_all": _counts(data["idea"], 30),
+        "anonymous_comments": comments,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+@st.cache_data(ttl=AI_REFRESH_SECONDS, show_spinner="Gemini is analysing the feedback...")
+def generate_insights(payload, model):
+    """
+    Sends the payload to Gemini and returns the AI insights as a dict.
+    Cached: the same payload + model re-uses the saved answer.
+    If this fails, nothing is cached and it is retried on the next visit.
+    """
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    response = client.models.generate_content(
+        model=model,
+        contents="FEEDBACK DATA (JSON):\n" + payload + "\n\n" + AI_OUTPUT_FORMAT,
+        config=types.GenerateContentConfig(
+            system_instruction=AI_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.3,   # low = more consistent, factual answers
+        ),
+    )
+    text = (response.text or "").replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
+
+
+def bullet_list(items):
+    """Shows a list of strings as markdown bullets."""
+    for item in items or []:
+        st.markdown(f"- {item}")
 
 # =====================================================================
 # DASHBOARD TABS
 # =====================================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# The AI tab is shown FIRST, but its code runs LAST (end of this file),
+# so all other charts appear instantly while Gemini is working.
+tab_ai, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🤖 AI Insights",
     "🏆 Trainer Portfolio",
     "⭐ Teaching Quality",
     "🏢 Batch Insights",
@@ -627,3 +772,96 @@ with tab5:
                 with st.container(border=True):
                     st.markdown(f"“{row['comment']}”")
                     st.caption(f"— {row['shown_name']}, {row['role']} · {row['course']}")
+
+
+# ---------------------------------------------------------------------
+# TAB 0 · AI INSIGHTS  – Gemini's analysis of all the feedback
+# (written last so the other tabs load first; it still appears first)
+# ---------------------------------------------------------------------
+with tab_ai:
+    model = st.secrets.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    st.subheader("🤖 AI Insights")
+    st.caption(
+        f"Generated by Google Gemini ({model}) from rating summaries and anonymous comments. "
+        "No names or emails are sent. AI can make mistakes, so compare with the charts."
+        + (" Based on synthetic demo data." if DEMO else "")
+    )
+
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.info("AI insights are not set up yet. Add GEMINI_API_KEY to the app's Secrets.")
+    else:
+        try:
+            ai = generate_insights(build_ai_payload(df), model)
+        except Exception:
+            ai = None
+            st.warning(
+                "AI insights are unavailable right now. The rest of the dashboard "
+                "still works. Please try again later."
+            )
+
+        if ai:
+            # Headline + summary
+            st.success(f"**{ai.get('headline', '')}**")
+            st.write(ai.get("summary", ""))
+
+            # Strengths | Improvements
+            c1, c2 = st.columns(2)
+            with c1:
+                with st.container(border=True):
+                    st.markdown("#### ✅ What's working well")
+                    bullet_list(ai.get("strengths"))
+            with c2:
+                with st.container(border=True):
+                    st.markdown("#### 🔧 What to improve")
+                    bullet_list(ai.get("improvements"))
+
+            # Difficult topics grouped into themes
+            themes = ai.get("difficult_themes") or []
+            if themes:
+                st.markdown("#### 🧩 Difficult topics, grouped by theme")
+                cols = st.columns(min(3, len(themes)))
+                for i, theme in enumerate(themes):
+                    with cols[i % len(cols)]:
+                        with st.container(border=True):
+                            st.markdown(f"**{theme.get('theme', '')}**")
+                            examples = theme.get("examples") or []
+                            if examples:
+                                st.caption("Includes: " + ", ".join(map(str, examples)))
+                            st.write("💡 " + str(theme.get("suggestion", "")))
+
+            # Sentiment of comments (AI-estimated)
+            sentiment = ai.get("sentiment") or {}
+            if sentiment:
+                st.markdown("#### 💬 Comment sentiment (AI-estimated)")
+                c1, c2 = st.columns([2, 3])
+                with c1:
+                    sent = pd.DataFrame({
+                        "Sentiment": ["Positive", "Neutral", "Negative"],
+                        "Percent": [sentiment.get("positive", 0),
+                                    sentiment.get("neutral", 0),
+                                    sentiment.get("negative", 0)],
+                    })
+                    fig = px.bar(sent, x="Percent", y="Sentiment", orientation="h",
+                                 text="Percent", color="Sentiment",
+                                 color_discrete_map={"Positive": "#2a9d8f",
+                                                     "Neutral": "#fcbf49",
+                                                     "Negative": "#e76f51"},
+                                 labels={"Sentiment": "", "Percent": "% of comments"})
+                    fig.update_layout(showlegend=False)
+                    show(fig, 250)
+                with c2:
+                    st.write(sentiment.get("summary", ""))
+
+            # Action plan per batch
+            actions = ai.get("batch_actions") or []
+            if actions:
+                st.markdown("#### 🎯 Action plan by batch")
+                for item in actions:
+                    with st.expander(f"{item.get('batch', '')} · {item.get('focus', '')}"):
+                        bullet_list(item.get("actions"))
+
+            # Tips for the next course
+            tips = ai.get("next_course_tips") or []
+            if tips:
+                st.markdown("#### 🚀 Tips for the next course")
+                bullet_list(tips)                 
