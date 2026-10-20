@@ -104,7 +104,7 @@ DEMO = DATA_SOURCE == "demo"
 
 try:
     if DEMO:
-        raw = pd.read_csv(DEMO_FILE, dtype=str, keep_default_na=False)
+        raw = pd.read_csv("Synthetic_Course_Feedback.csv", dtype=str, keep_default_na=False)
     else:
         raw, fetched_at = load_sheet()
 except Exception:
